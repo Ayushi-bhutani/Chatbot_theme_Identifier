@@ -1,0 +1,52 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Package distribution and build artifacts
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# IDE-specific files
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Docker-related
+*.pid
+*.db
+*.sqlite3
+
+# Application-specific: add folders you don't want in Git
+data/
+docs/*.pdf
+
+# Optional: exclude test outputs or generated files
+*.out
+*.test
+
+# Ignore files created during experimentation
+test_vector_db.py
