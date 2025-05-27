@@ -25,10 +25,19 @@ from fastapi import APIRouter
 from app.services.vector_db import VectorDB
 from app.services.theme_analyzer import ThemeAnalyzer
 from app.schemas import QueryRequest
+from collections import defaultdict
+import re
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
 nltk.download('punkt')  # This downloads the tokenizer models
 from nltk.tokenize import sent_tokenize
+from app.services.theme_analyzer import ThemeAnalyzer
+# Initialize
+JSON_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
+theme_analyzer = ThemeAnalyzer(JSON_DIR)
 
-
+# Usage in endpoint
+themes = theme_analyzer.analyze_themes_tfidf()
 # Load environment variables
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
 if not os.getenv("OPENAI_API_KEY"):
@@ -305,36 +314,8 @@ async def query_documents(
 
     return response
 
-@app.get("/synthesize/")
-def synthesize_themes():
-    """Identify common themes across documents"""
-    word_doc_map = defaultdict(set)
-    doc_summaries = {}
+# @app.get("/synthesize/")
 
-    for json_file in JSON_DIR.glob("*.json"):
-        doc_id = json_file.stem
-        with open(json_file, "r", encoding="utf-8") as f:
-            pages = json.load(f)
-
-        all_text = " ".join([s["text"] for p in pages if "sentences" in p for s in p["sentences"]])
-        doc_summaries[doc_id] = all_text[:500] + "..."
-        words = re.findall(r'\b\w{6,}\b', all_text.lower())
-
-        for word in words:
-            word_doc_map[word].add(doc_id)
-
-    theme_candidates = {w: list(docs) for w, docs in word_doc_map.items() if len(docs) > 1}
-    themes = []
-
-    for theme_word, docs in list(theme_candidates.items())[:5]:
-        summary_snippets = [f"{doc_id}: {doc_summaries[doc_id]}" for doc_id in docs]
-        themes.append({
-            "theme": theme_word,
-            "documents": docs,
-            "summary_snippets": summary_snippets
-        })
-
-    return {"themes_found": len(themes), "themes": themes}
 
 @app.post("/summarize_theme/", response_model=ThemeResponse)
 async def summarize_theme(request: ThemeSummaryRequest):

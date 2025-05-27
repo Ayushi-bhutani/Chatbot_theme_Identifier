@@ -159,7 +159,16 @@ class VectorDB:
                         "context": self._get_context(hit.payload),
                         "score": hit.score,
                         "type": "medical" if hit.payload.get("is_medical") else "general",
-                        "citation": self._format_citation(hit.payload)
+                        "citation": {
+        "doc_id": "DOC123",
+        "page": 5,
+        "paragraph": 2,
+        "sentence": 12,
+        "text_excerpt": "The study found...",
+        "surrounding_context": "Previous research... [text]... Subsequent work..."
+    }
+                        
+                    
                     })
             
             return sorted(processed_results, key=lambda x: x["score"], reverse=True)[:top_k]
