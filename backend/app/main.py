@@ -1,17 +1,10 @@
 import os
 from dotenv import load_dotenv
-
-# ✅ Load .env variables first
-load_dotenv()
-from app.services.vector_db import VectorDB
-from app.services.gpt_summarizer import generate_theme_summary
-vector_db = VectorDB() 
-import openai
 from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Optional
 from collections import defaultdict
 import shutil
 import pytesseract
@@ -21,27 +14,34 @@ import fitz  # PyMuPDF
 import json
 import re
 import traceback
-# ✅ Load environment variables early
+import uuid
+import magic  # python-magic package
+import nltk
+from datetime import datetime
+from app.services.vector_db import VectorDB
+from app.services.gpt_summarizer import generate_theme_summary
+import nltk
+from fastapi import APIRouter
+from app.services.vector_db import VectorDB
+from app.services.theme_analyzer import ThemeAnalyzer
+from app.schemas import QueryRequest
+nltk.download('punkt')  # This downloads the tokenizer models
+from nltk.tokenize import sent_tokenize
+
+
+# Load environment variables
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
-print("Loaded OPENAI_API_KEY =", os.getenv("OPENAI_API_KEY"))
-
-# ✅ Now use the loaded variables
-import openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
-print("OpenAI Key:", openai.api_key)  # Optional for debug
-
-# ✅ Handle missing key
-if not openai.api_key:
+if not os.getenv("OPENAI_API_KEY"):
     raise RuntimeError("OPENAI_API_KEY environment variable is not set!")
 
-_themes_cache = []
-
+# Initialize services
+vector_db = VectorDB()
 app = FastAPI()
-
+theme_analyzer = ThemeAnalyzer()
 # --- CORS Setup ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict origins in production!
+    allow_origins=["*"],  # Restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,35 +57,49 @@ JSON_DIR = UPLOAD_DIR / "extracted_json"
 for folder in [UPLOAD_DIR, PDF_DIR, TEXT_DIR, JSON_DIR]:
     folder.mkdir(parents=True, exist_ok=True)
 
-# --- Pydantic Models for theme summary endpoint ---
-
+# --- Pydantic Models ---
 class ThemeSummaryRequest(BaseModel):
     theme: str
     documents: List[str]
     summary_snippets: List[str]
 
-
 class ThemeResponse(BaseModel):
     theme: str
     gpt_summary: str
-# Add these imports at the top if not already present
 
-import magic  # python-magic package
-from typing import Optional
-from datetime import datetime
-import nltk
-nltk.download('punkt')
-from typing import List
-from pathlib import Path
-from datetime import datetime
-import pdfplumber
-from nltk.tokenize import sent_tokenize
-import fitz  # PyMuPDF
-from PIL import Image
-import pytesseract
+class QueryRequest(BaseModel):
+    text: str
+    filter_by: Optional[dict] = None
+
+# --- Document Processing Functions ---
+def process_document(text: str, page_number: int) -> List[Dict]:
+    """Split document text into sentences with metadata"""
+    try:
+        sentences = sent_tokenize(text)
+        return {
+            "page_number": page_number,
+            "full_text": text,
+            "sentences": [
+                {"text": s, "sentence_id": i} 
+                for i, s in enumerate(sentences)
+            ]
+        }
+    except Exception as e:
+        print(f"Sentence tokenization error: {e}")
+        # Fallback to simple split if tokenization fails
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
+        return {
+            "page_number": page_number,
+            "full_text": text,
+            "sentences": [
+                {"text": s, "sentence_id": i} 
+                for i, s in enumerate(sentences)
+            ],
+            "warning": "Used simple sentence splitting"
+        }
 
 def extract_text_from_pdf(pdf_path: Path) -> List[dict]:
-    """Enhanced PDF text extraction with metadata, sentence tokenization, and better OCR handling"""
+    """Enhanced PDF text extraction with metadata and sentence tokenization"""
     text_data = []
     metadata = {
         "filename": pdf_path.name,
@@ -95,34 +109,24 @@ def extract_text_from_pdf(pdf_path: Path) -> List[dict]:
     }
     
     try:
-        # First try with pdfplumber
         with pdfplumber.open(pdf_path) as pdf:
             metadata["page_count"] = len(pdf.pages)
             for i, page in enumerate(pdf.pages, start=1):
                 content = page.extract_text()
                 if not content:
-                    # If no text found, try harder with alternative extraction
                     content = page.extract_text(x_tolerance=1, y_tolerance=1)
                     if not content:
                         metadata["is_scanned"] = True
                         raise ValueError("Possible scanned document")
                 
-                # Split page text into sentences
-                sentences = sent_tokenize(content.strip())
-                for sent in sentences:
-                    text_data.append({
-                        "page": i,
-                        "text": sent,
-                        "sentence_id": len(text_data) + 1,
-                        "bbox": page.bbox
-                    })
+                page_data = process_document(content.strip(), i)
+                text_data.append(page_data)
                 
     except Exception as e:
         print(f"[INFO] Falling back to OCR processing: {str(e)}")
         text_data = ocr_scanned_pdf(pdf_path)
         metadata["is_scanned"] = True
     
-    # Add metadata to the first sentence/page entry
     if text_data:
         text_data[0]["metadata"] = metadata
     
@@ -135,40 +139,30 @@ def ocr_scanned_pdf(pdf_path: Path) -> List[dict]:
     
     for i, page in enumerate(doc, start=1):
         try:
-            # Get page as image with higher DPI for better OCR
             pix = page.get_pixmap(dpi=300)
             image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            image = image.convert('L').point(lambda x: 0 if x < 128 else 255, '1')
             
-            # Preprocess image for better OCR results
-            image = image.convert('L')  # Grayscale
-            image = image.point(lambda x: 0 if x < 128 else 255, '1')  # Thresholding
-            
-            # Custom OCR configuration
             custom_config = r'--oem 3 --psm 6'
             text = pytesseract.image_to_string(image, config=custom_config)
             
-            # Split OCR text into sentences as well
-            sentences = sent_tokenize(text.strip())
-            for sent in sentences:
-                text_by_page.append({
-                    "page": i,
-                    "text": sent,
-                    "ocr_processed": True
-                })
+            page_data = process_document(text.strip(), i)
+            page_data["ocr_processed"] = True
+            text_by_page.append(page_data)
         except Exception as e:
             print(f"Error processing page {i}: {str(e)}")
             text_by_page.append({
-                "page": i,
-                "text": "",
+                "page_number": i,
+                "sentences": [],
                 "error": str(e)
             })
     
     return text_by_page
 
-
+# --- API Endpoints ---
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...)):
-    # Validate file type using magic numbers
+    """Handle PDF uploads with validation and processing"""
     file_content = await file.read(2048)
     await file.seek(0)
     
@@ -176,7 +170,6 @@ async def upload_file(file: UploadFile = File(...)):
     if mime_type != 'application/pdf':
         raise HTTPException(400, "Only PDF files are accepted")
     
-    # Validate file size (max 50MB)
     max_size = 50 * 1024 * 1024  # 50MB
     file.file.seek(0, 2)
     file_size = file.file.tell()
@@ -187,15 +180,12 @@ async def upload_file(file: UploadFile = File(...)):
     
     pdf_path = PDF_DIR / file.filename
     
-    # Check for existing file
     if pdf_path.exists():
         raise HTTPException(400, "File with this name already exists")
     
-    # Save the file
     with open(pdf_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
     
-    # Validate PDF structure
     try:
         with fitz.open(pdf_path) as doc:
             if not doc.is_pdf:
@@ -205,70 +195,66 @@ async def upload_file(file: UploadFile = File(...)):
         os.remove(pdf_path)
         raise HTTPException(400, "Invalid PDF file")
     
-    # Process the PDF
     try:
         extracted_data = extract_text_from_pdf(pdf_path)
         
-        # Save extracted text as JSON
         json_path = JSON_DIR / f"{file.filename}.json"
         with open(json_path, "w", encoding="utf-8") as jf:
             json.dump(extracted_data, jf, ensure_ascii=False, indent=2)
         
-        # Index in vector database (new addition)
         try:
             vector_db.index_document(file.filename, extracted_data)
         except Exception as vec_err:
             print(f"Vector DB indexing error: {vec_err}")
-            # Don't fail the upload, just log the error
-            # You might want to implement retry logic here
         
         return {
             "filename": file.filename,
             "message": "Uploaded, text extracted, and indexed successfully.",
             "metadata": extracted_data[0].get("metadata", {}) if extracted_data else {},
-            "vector_status": "indexed"  # new field to indicate vector DB status
+            "vector_status": "indexed"
         }
     except Exception as e:
-        # Cleanup in case of failure
         if pdf_path.exists():
             os.remove(pdf_path)
         json_path = JSON_DIR / f"{file.filename}.json"
         if json_path.exists():
             os.remove(json_path)
-        
         raise HTTPException(500, f"Failed to process PDF: {str(e)}")
 
-
-# --- Query documents endpoint ---
 @app.post("/query/")
-def query_documents(
-    question: str = Query(..., min_length=3, description="Your search query"),
-    semantic: bool = Query(True, description="Use semantic search (vector DB)"),
-    keyword: bool = Query(False, description="Also include keyword matches"),
-    limit: int = Query(5, description="Number of results to return")
+async def query_documents(
+    question: str = Query(..., min_length=3),
+    semantic: bool = Query(True),
+    keyword: bool = Query(False),
+    limit: int = Query(5),
+    analyze_themes: bool = Query(True, description="Enable theme analysis")
 ):
     """
-    Search across documents using either semantic search (default) or keyword matching.
-    Returns results with citations and relevance scores.
+    Search documents with semantic and keyword options.
+    Returns results with citations and optional theme analysis.
     """
+    # Initialize variables
     results = []
+    theme_analyzer = ThemeAnalyzer()
     
     # Semantic Search (Vector DB)
     if semantic:
         try:
-            vector_results = vector_db.search(question, limit=limit)
+            vector_results = vector_db.search(question, limit=limit*3)  # Over-fetch for theme analysis
             for res in vector_results:
                 results.append({
                     "document": res["doc_id"],
                     "page": res["page"],
+                    "sentence": res["sentence_id"],
                     "excerpt": highlight_query(res["text"], question),
+                    "text": res["text"],  # Keep full text for theme analysis
                     "score": float(res["score"]),
                     "type": "semantic",
-                    "citation": f"{res['doc_id']}, Page {res['page']}"
+                    "citation": f"{res['doc_id']}, Page {res['page']}, Sentence {res['sentence_id']}"
                 })
         except Exception as e:
             print(f"Vector search error: {e}")
-            if not keyword:  # Only fail if keyword search also disabled
+            if not keyword:
                 raise HTTPException(500, "Semantic search temporarily unavailable")
 
     # Keyword Search (Fallback or hybrid mode)
@@ -277,142 +263,112 @@ def query_documents(
             with open(file, "r", encoding="utf-8") as f:
                 pages = json.load(f)
                 for page in pages:
-                    text = page.get("text", "").lower()
-                    if question.lower() in text:
-                        results.append({
-                            "document": file.stem.replace(".pdf", ""),
-                            "page": page["page"],
-                            "excerpt": highlight_query(page["text"], question),
-                            "score": 0.5,  # Default score for keyword matches
-                            "type": "keyword",
-                            "citation": f"{file.stem.replace('.pdf', '')}, Page {page['page']}"
-                        })
+                    if "sentences" in page:
+                        for sent in page["sentences"]:
+                            if question.lower() in sent["text"].lower():
+                                results.append({
+                                    "document": file.stem,
+                                    "page": page["page_number"],
+                                    "sentence": sent["sentence_id"],
+                                    "excerpt": highlight_query(sent["text"], question),
+                                    "text": sent["text"],  # Keep full text for theme analysis
+                                    "score": 0.5,
+                                    "type": "keyword",
+                                    "citation": f"{file.stem}, Page {page['page_number']}, Sentence {sent['sentence_id']}"
+                                })
 
-    # Sort combined results by score (highest first)
+    # Sort and limit results
     results.sort(key=lambda x: x["score"], reverse=True)
+    final_results = results[:limit]
     
-    # Apply limit
-    results = results[:limit]
-    
-    return {
+    # Prepare response
+    response = {
         "query": question,
-        "results": results,
-        "count": len(results)
+        "results": final_results,
+        "count": len(final_results)
     }
 
-def highlight_query(text: str, query: str, snippet_length: int = 300) -> str:
-    """
-    Returns a text snippet with query terms highlighted (case insensitive)
-    """
-    text_lower = text.lower()
-    query_lower = query.lower()
-    
-    # Find first occurrence
-    start_pos = text_lower.find(query_lower)
-    if start_pos == -1:
-        return text[:snippet_length] + "..." if len(text) > snippet_length else text
-    
-    # Get surrounding context
-    snippet_start = max(0, start_pos - snippet_length//2)
-    snippet_end = min(len(text), start_pos + len(query) + snippet_length//2)
-    snippet = text[snippet_start:snippet_end]
-    
-    # Highlight the query terms
-    for term in query.split():
-        if len(term) > 3:  # Only highlight significant terms
-            snippet = re.sub(
-                f"({term})", 
-                r"[**\1**]", 
-                snippet, 
-                flags=re.IGNORECASE
+    # Add theme analysis if enabled
+    if analyze_themes and len(results) > 1:
+        try:
+            theme_response = await theme_analyzer.generate_synthesized_response(
+                query=question,
+                search_results=results  # Use all results (not just limited ones) for better theme detection
             )
-    
-    return ("..." if snippet_start > 0 else "") + snippet + ("..." if snippet_end < len(text) else "")
-# --- Synthesize themes endpoint ---
+            response.update({
+                "themes": theme_response["identified_themes"],
+                "synthesis": theme_response["synthesized_summary"]
+            })
+        except Exception as e:
+            print(f"Theme analysis failed: {e}")
+            response["theme_analysis_error"] = "Could not generate themes"
+
+    return response
+
 @app.get("/synthesize/")
 def synthesize_themes():
+    """Identify common themes across documents"""
     word_doc_map = defaultdict(set)
     doc_summaries = {}
 
     for json_file in JSON_DIR.glob("*.json"):
-        doc_id = json_file.stem.replace(".pdf", "")
+        doc_id = json_file.stem
         with open(json_file, "r", encoding="utf-8") as f:
             pages = json.load(f)
 
-        all_text = " ".join([p["text"] for p in pages if p.get("text")])
+        all_text = " ".join([s["text"] for p in pages if "sentences" in p for s in p["sentences"]])
         doc_summaries[doc_id] = all_text[:500] + "..."
-        words = re.findall(r'\b\w{6,}\b', all_text.lower())  # Words of length >=6
+        words = re.findall(r'\b\w{6,}\b', all_text.lower())
 
         for word in words:
             word_doc_map[word].add(doc_id)
 
-    # Filter words appearing in multiple documents as themes
     theme_candidates = {w: list(docs) for w, docs in word_doc_map.items() if len(docs) > 1}
-
-    # Build themes list
     themes = []
-    for theme_word, docs in list(theme_candidates.items())[:5]:  # limit to 5 themes
-        summary_snippets = []
-        for doc_id in docs:
-            summary_snippets.append(f"{doc_id}: {doc_summaries[doc_id]}")
+
+    for theme_word, docs in list(theme_candidates.items())[:5]:
+        summary_snippets = [f"{doc_id}: {doc_summaries[doc_id]}" for doc_id in docs]
         themes.append({
             "theme": theme_word,
             "documents": docs,
             "summary_snippets": summary_snippets
         })
 
-    # Save themes globally for use in /themes endpoint
-    global _themes_cache
-    _themes_cache = themes
-
     return {"themes_found": len(themes), "themes": themes}
-
-# --- Get themes with GPT summaries ---
-
-# def generate_theme_summary(theme: str, snippets: List[str]) -> str:
-#     prompt = (
-#         f"Summarize the following scientific literature snippets related to the theme '{theme}' "
-#         f"into a concise, informative paragraph:\n\n"
-#         + "\n\n".join(snippets)
-#     )
-#     try:
-#         response = openai.chat.completions.create(
-#             model="gpt-4o-mini",
-#             messages=[
-#                 {"role": "system", "content": "You are an expert scientific summarizer."},
-#                 {"role": "user", "content": prompt},
-#             ],
-#             max_tokens=300,
-#             temperature=0.5,
-#         )
-#         summary = response.choices[0].message.content.strip()
-#         return summary
-#     except Exception as e:
-#         print("OpenAI API error:", e)
-#         traceback.print_exc()
-#         return "Summary could not be generated at this time."
-
-
-# @app.post("/summarize_theme/", response_model=ThemeResponse)
-# async def summarize_theme(request: ThemeSummaryRequest):
-#     if not request.summary_snippets or not request.theme:
-#         raise HTTPException(status_code=422, detail="Theme, documents and summary_snippets must be provided and non-empty.")
-#     # Now you can access request.documents if needed
-#     summary = generate_theme_summary(request.theme, request.summary_snippets)
-#     return ThemeResponse(theme=request.theme, gpt_summary=summary)
-
 
 @app.post("/summarize_theme/", response_model=ThemeResponse)
 async def summarize_theme(request: ThemeSummaryRequest):
+    """Generate GPT summary for a theme"""
     if not request.summary_snippets or not request.theme:
-        raise HTTPException(status_code=422, detail="Theme, documents and summary_snippets must be provided and non-empty.")
+        raise HTTPException(422, "Theme and snippets must be provided")
     
     summary = generate_theme_summary(request.theme, request.summary_snippets)
     return ThemeResponse(theme=request.theme, gpt_summary=summary)
 
-# Add this temporary debug endpoint to backend/app/main.py
+# --- Utility Functions ---
+def highlight_query(text: str, query: str, snippet_length: int = 300) -> str:
+    """Highlight query terms in text snippet"""
+    text_lower = text.lower()
+    query_lower = query.lower()
+    
+    start_pos = text_lower.find(query_lower)
+    if start_pos == -1:
+        return text[:snippet_length] + "..." if len(text) > snippet_length else text
+    
+    snippet_start = max(0, start_pos - snippet_length//2)
+    snippet_end = min(len(text), start_pos + len(query) + snippet_length//2)
+    snippet = text[snippet_start:snippet_end]
+    
+    for term in query.split():
+        if len(term) > 3:
+            snippet = re.sub(f"({term})", r"[**\1**]", snippet, flags=re.IGNORECASE)
+    
+    return ("..." if snippet_start > 0 else "") + snippet + ("..." if snippet_end < len(text) else "")
+
+# --- Debug Endpoints ---
 @app.get("/debug/{filename}")
 def debug_document(filename: str):
+    """Debug endpoint for document inspection"""
     json_path = JSON_DIR / f"{filename}.json"
     if not json_path.exists():
         return {"error": "File not processed"}
@@ -420,16 +376,16 @@ def debug_document(filename: str):
     with open(json_path, "r") as f:
         content = json.load(f)
     
-    # Check if vector DB has this doc
-    vector_results = vector_db.search("liver", limit=1)
+    vector_results = vector_db.search("sample query", limit=1)
     return {
         "text_extracted": bool(content),
         "vector_db_has_doc": any(r["doc_id"] == filename for r in vector_results),
-        "first_page_text": content[0]["text"][:200] if content else None
+        "first_page_text": content[0]["sentences"][0]["text"][:200] if content and "sentences" in content[0] else None
     }
-# Temporary reindex endpoint
+
 @app.post("/reindex/")
 def reindex_all():
+    """Reindex all documents in the vector database"""
     for pdf in PDF_DIR.glob("*.pdf"):
         extracted = extract_text_from_pdf(pdf)
         vector_db.index_document(pdf.name, extracted)
