@@ -1,7 +1,4 @@
-from collections import defaultdict
-import re
 import os
-import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from typing import List, Dict
 from pathlib import Path
@@ -48,7 +45,8 @@ class ThemeAnalyzer:
         # 2. Identify significant themes
         significant_phrases = set()
         for i in range(len(documents)):
-            top_phrases = feature_names[matrix[i].toarray().argsort()[0][-5:]]  # Top 5 phrases per doc
+            top_phrases = feature_names[matrix[i].toarray().argsort()[0][-5:]]  # Top 5 phrases per 
+    
             significant_phrases.update(top_phrases)
         
         # 3. Build theme-document mapping

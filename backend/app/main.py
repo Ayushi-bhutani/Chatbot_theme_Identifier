@@ -32,21 +32,33 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 nltk.download('punkt')  # This downloads the tokenizer models
 from nltk.tokenize import sent_tokenize
 from app.services.theme_analyzer import ThemeAnalyzer
-# Initialize
-JSON_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
-theme_analyzer = ThemeAnalyzer(JSON_DIR)
+from app.static.theme_visualizer import router as viz_router
 
-# Usage in endpoint
-themes = theme_analyzer.analyze_themes_tfidf()
+
 # Load environment variables
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
-if not os.getenv("OPENAI_API_KEY"):
+import os
+from dotenv import load_dotenv
+
+# ✅ Load the .env from backend folder
+env_path = os.path.join(os.path.dirname(__file__), '..', '.env')
+load_dotenv(dotenv_path=env_path)
+
+# ✅ Validate key is loaded
+openai_api_key = os.getenv("OPENAI_API_KEY")
+print("Loaded OPENAI_API_KEY =", openai_api_key)
+
+if not openai_api_key:
     raise RuntimeError("OPENAI_API_KEY environment variable is not set!")
+
+# ✅ Then assign it to OpenAI
+import openai
+openai.api_key = openai_api_key
 
 # Initialize services
 vector_db = VectorDB()
 app = FastAPI()
 theme_analyzer = ThemeAnalyzer()
+app.include_router(viz_router, prefix="/api")
 # --- CORS Setup ---
 app.add_middleware(
     CORSMiddleware,
@@ -371,3 +383,18 @@ def reindex_all():
         extracted = extract_text_from_pdf(pdf)
         vector_db.index_document(pdf.name, extracted)
     return {"status": "reindexed"}
+from app.services.report_generator import ReportGenerator
+
+@app.get("/api/report")
+async def generate_report():
+    analyzer = ThemeAnalyzer(JSON_DIR)
+    documents = [...]  # Load your documents
+    themes = analyzer.extract_common_themes(documents)
+    
+    reporter = ReportGenerator()
+    report = await reporter.generate_theme_report(themes, documents)
+    
+    return {
+        "report": report,
+        "visualization_url": f"/api/visualize?search={report['statistics']['most_common_theme']}"
+    }
