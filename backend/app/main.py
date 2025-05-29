@@ -57,7 +57,8 @@ openai.api_key = openai_api_key
 # Initialize services
 vector_db = VectorDB()
 app = FastAPI()
-theme_analyzer = ThemeAnalyzer()
+# theme_analyzer = ThemeAnalyzer()
+theme_analyzer = ThemeAnalyzer(json_dir="../data/extracted_json")
 app.include_router(viz_router, prefix="/api")
 # --- CORS Setup ---
 app.add_middleware(
@@ -186,6 +187,16 @@ async def upload_file(file: UploadFile = File(...)):
     """Handle PDF uploads with validation and processing"""
     file_content = await file.read(2048)
     await file.seek(0)
+    # Add to your upload endpoint
+    extracted_data = extract_text_from_pdf(pdf_path)
+    if extracted_data[0]['metadata']['is_scanned']:
+        extracted_data = apply_enhanced_ocr(pdf_path)  # Use OCR for scans
+    
+    # Store with paragraph-level metadata
+    json_path.write_text(json.dumps({
+        "pages": extracted_data,
+        "is_scanned": extracted_data[0]['metadata']['is_scanned']
+    }))
     
     mime_type = magic.from_buffer(file_content, mime=True)
     if mime_type != 'application/pdf':
@@ -256,7 +267,8 @@ async def query_documents(
     """
     # Initialize variables
     results = []
-    theme_analyzer = ThemeAnalyzer()
+    
+    theme_analyzer = ThemeAnalyzer(json_dir="../data/extracted_json")
     
     # Semantic Search (Vector DB)
     if semantic:
@@ -398,3 +410,109 @@ async def generate_report():
         "report": report,
         "visualization_url": f"/api/visualize?search={report['statistics']['most_common_theme']}"
     }
+from pdf2image import convert_from_path
+import pytesseract
+
+def apply_enhanced_ocr(pdf_path: Path) -> List[dict]:
+    """Process scanned PDFs with paragraph detection"""
+    images = convert_from_path(pdf_path, dpi=300)
+    text_data = []
+    
+    for i, image in enumerate(images):
+        # OCR with layout analysis
+        ocr_data = pytesseract.image_to_data(
+            image, 
+            output_type=pytesseract.Output.DICT,
+            config='--psm 6 -c preserve_interword_spaces=1'
+        )
+        
+        # Group by paragraphs
+        paragraph_id = 0
+        current_para = ""
+        
+        for j, word in enumerate(ocr_data['text']):
+            if ocr_data['block_num'][j] != paragraph_id:
+                if current_para.strip():
+                    text_data.append({
+                        "page": i+1,
+                        "paragraph": paragraph_id,
+                        "text": current_para.strip()
+                    })
+                current_para = ""
+                paragraph_id = ocr_data['block_num'][j]
+            current_para += word + " "
+    
+    return text_data
+from collections import defaultdict
+import networkx as nx
+import plotly.graph_objects as go
+def extract_key_themes(text: str, n_themes: int = 5) -> List[str]:
+    """Extract key themes from text using TF-IDF"""
+    vectorizer = TfidfVectorizer(
+        max_features=n_themes,
+        stop_words='english',
+        ngram_range=(1, 2)  # Include single words and bigrams
+    )
+    
+    # Process text and get top weighted terms
+    tfidf_matrix = vectorizer.fit_transform([text])
+    feature_names = vectorizer.get_feature_names_out()
+    sorted_items = sorted(
+        zip(feature_names, tfidf_matrix.sum(axis=0).tolist()[0]),
+        key=lambda x: x[1],
+        reverse=True
+    )
+    
+    return [term for term, score in sorted_items[:n_themes]]
+@app.get("/theme_network")
+def generate_theme_network(min_docs: int = 3):
+    """Generate interactive network graph of themes"""
+    # 1. Extract themes and document relationships
+    theme_docs = defaultdict(list)
+    for json_file in JSON_DIR.glob("*.json"):
+        with open(json_file) as f:
+            text = " ".join([p["text"] for p in json.load(f)])
+
+            themes = extract_key_themes(text)  # Reuse your theme extraction
+            for theme in themes:
+                theme_docs[theme].append(json_file.stem)
+    
+    # 2. Build network graph
+    G = nx.Graph()
+    for theme, docs in theme_docs.items():
+        if len(docs) >= min_docs:  # Only significant themes
+            G.add_node(theme, type="theme", size=len(docs)*5)
+            for doc in docs:
+                G.add_node(doc, type="document")
+                G.add_edge(theme, doc)
+    
+    # 3. Convert to Plotly visualization
+    pos = nx.spring_layout(G)
+    edge_x, edge_y = [], []
+    for edge in G.edges():
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+    
+    node_x, node_y, node_text, node_color = [], [], [], []
+    for node in G.nodes():
+        node_x.append(pos[node][0])
+        node_y.append(pos[node][1])
+        node_text.append(node)
+        node_color.append("red" if G.nodes[node]["type"] == "theme" else "blue")
+    
+    fig = go.Figure(
+        data=[
+            go.Scatter(x=edge_x, y=edge_y, line=dict(width=0.5, color="#888"), hoverinfo="none", mode="lines"),
+            go.Scatter(
+                x=node_x, y=node_y,
+                mode="markers+text",
+                text=node_text,
+                marker=dict(color=node_color, size=20 if "theme" in node_text else 10),
+                hoverinfo="text"
+            )
+        ],
+        layout=go.Layout(showlegend=False, hovermode="closest")
+    )
+    return fig.to_json()

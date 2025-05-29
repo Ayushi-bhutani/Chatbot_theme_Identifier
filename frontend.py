@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 from typing import List, Dict
+import plotly.graph_objects as go  # Added for theme network visualization
 
 # Set page config
 st.set_page_config(page_title="Document Research Chatbot", layout="wide")
@@ -42,9 +43,9 @@ if uploaded_files:
                 st.error(f"Failed to upload {fail_count} files. Please try again.")
 
 # --- 2. Document management ---
-
 st.header("2. Uploaded Documents Overview")
 
+docs = []
 try:
     resp = requests.get(f"{API_BASE}/documents/")
     if resp.status_code == 200:
@@ -70,7 +71,6 @@ except Exception as e:
     st.error(f"Error fetching documents: {str(e)}")
 
 # --- 3. Query input & options ---
-
 st.header("3. Ask a Question")
 
 query = st.text_input("Enter your question about the uploaded documents:")
@@ -98,7 +98,6 @@ if st.button("Search"):
                 "limit": limit_results,
             }
             if selected_docs:
-                # Extract doc IDs from selection format "id - filename"
                 doc_ids = [doc.split(" - ")[0] for doc in selected_docs]
                 params["documents"] = ",".join(doc_ids)
 
@@ -130,6 +129,20 @@ if st.button("Search"):
 
             except Exception as e:
                 st.error(f"Error during query processing: {str(e)}")
+
+# --- 4. Theme Network Visualization ---
+st.header("4. Document Theme Network Visualization")
+
+def show_theme_network():
+    st.subheader("Document Theme Network")
+    try:
+        network_json = requests.get("http://localhost:8000/theme_network").json()
+        fig = go.Figure(network_json)
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Error loading theme network: {str(e)}")
+
+show_theme_network()
 
 st.markdown("---")
 st.caption("Powered by Wasserstoff - AI Intern Project")

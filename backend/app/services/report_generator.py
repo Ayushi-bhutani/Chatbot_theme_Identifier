@@ -1,10 +1,22 @@
-from app.utils.imports import *
+from typing import List, Dict
 from datetime import datetime
-from weasyprint import HTML
+from io import BytesIO
+from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+import os
+from openai import AsyncOpenAI
+import asyncio
+
+# Load environment variables
+load_dotenv()
+
 class ReportGenerator:
     def __init__(self):
-        self.client = AsyncOpenAI()
-        
+        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
     async def generate_theme_report(self, themes: List[Dict], documents: List[Dict]) -> Dict:
         """Generate comprehensive theme analysis report"""
         report = {
@@ -22,15 +34,12 @@ class ReportGenerator:
         """Generate AI summaries for each theme"""
         processed = []
         for theme in themes:
-            summary = await self._generate_ai_summary(
-                theme["name"], 
-                theme["documents"]
-            )
+            summary = await self._generate_ai_summary(theme["name"], theme["documents"])
             processed.append({
                 "theme": theme["name"],
                 "document_count": len(theme["documents"]),
                 "summary": summary,
-                "representative_docs": theme["documents"][:3]  # Top 3 docs
+                "representative_docs": theme["documents"][:3]
             })
         return processed
 
@@ -38,13 +47,13 @@ class ReportGenerator:
         """Generate GPT-4 summary of a theme"""
         prompt = f"""
         Analyze the theme '{theme}' across {len(doc_ids)} documents.
-        Provide a 3-5 paragraph summary that:
+        Provide a 3–5 paragraph summary that:
         1. Defines the core concept
         2. Identifies key findings
         3. Notes any controversies
         4. Highlights significant evidence
-        
-        Write in academic tone for medical researchers.
+
+        Write in an academic tone for medical researchers.
         """
         response = await self.client.chat.completions.create(
             model="gpt-4-turbo-preview",
@@ -56,25 +65,27 @@ class ReportGenerator:
     def _calculate_stats(self, themes: List[Dict]) -> Dict:
         """Calculate theme statistics"""
         theme_counts = [len(t["documents"]) for t in themes]
+        unique_docs = len(set(d for t in themes for d in t["documents"]))
         return {
             "most_common_theme": max(themes, key=lambda x: len(x["documents"]))["name"],
-            "avg_docs_per_theme": sum(theme_counts)/len(theme_counts),
-            "theme_coverage": sum(theme_counts)/len(set(d for t in themes for d in t["documents"]))
+            "avg_docs_per_theme": sum(theme_counts) / len(theme_counts) if theme_counts else 0,
+            "theme_coverage": sum(theme_counts) / unique_docs if unique_docs else 0
         }
+
     async def generate_pdf(self, report: Dict) -> bytes:
         """Generate PDF using ReportLab"""
         buffer = BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter)
-        
         styles = getSampleStyleSheet()
         story = []
-        
+
         # Add title
         story.append(Paragraph(
             f"Theme Analysis Report - {report['metadata']['generated_at']}",
             styles['Title']
         ))
-        
+        story.append(Spacer(1, 0.2 * inch))
+
         # Add statistics
         story.append(Paragraph("Summary Statistics", styles['Heading2']))
         stats = [
@@ -86,7 +97,7 @@ class ReportGenerator:
         for stat in stats:
             story.append(Paragraph(stat, styles['Normal']))
             story.append(Spacer(1, 0.1 * inch))
-        
+
         # Add themes
         story.append(Paragraph("Theme Details", styles['Heading2']))
         for theme in report['themes']:
@@ -96,7 +107,13 @@ class ReportGenerator:
             ))
             story.append(Paragraph(theme['summary'], styles['Normal']))
             story.append(Spacer(1, 0.2 * inch))
-        
+
         doc.build(story)
         buffer.seek(0)
         return buffer.getvalue()
+
+    async def generate_and_return_pdf(self, themes: List[Dict], documents: List[Dict]) -> bytes:
+        """Full wrapper: Generate report then PDF"""
+        report = await self.generate_theme_report(themes, documents)
+        pdf = await self.generate_pdf(report)
+        return pdf

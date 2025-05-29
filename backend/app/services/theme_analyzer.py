@@ -79,8 +79,9 @@ class ThemeAnalyzer:
 
 # Usage Example:
 if __name__ == "__main__":
-    JSON_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
-    analyzer = ThemeAnalyzer(JSON_DIR)
+    # JSON_DIR = backend\data\extracted_json
+    analyzer = ThemeAnalyzer(json_dir="../data/extracted_json")
+    
     themes = analyzer.analyze_themes_tfidf()
     print(f"Found {len(themes)} themes:")
     for theme in themes:

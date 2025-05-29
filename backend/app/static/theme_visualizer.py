@@ -1,11 +1,11 @@
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
 import json
-from typing import List, Dict
+from typing import List, Dict, DefaultDict
 from pathlib import Path
-
+from sklearn.feature_extraction.text import TfidfVectorizer
+from collections import defaultdict
 router = APIRouter()
-
 def generate_d3_visualization(themes: List[Dict], documents: List[Dict]) -> str:
     """Generate HTML with D3.js visualization"""
     return f"""
@@ -167,10 +167,70 @@ def generate_d3_visualization(themes: List[Dict], documents: List[Dict]) -> str:
     </body>
     </html>
     """
+def extract_key_themes(text: str, n_themes: int = 5) -> List[str]:
+    """Extract key themes from text using TF-IDF"""
+    vectorizer = TfidfVectorizer(
+        max_features=n_themes,
+        stop_words='english',
+        ngram_range=(1, 2)  # Include single words and bigrams
+    )
+    
+    # Process text and get top weighted terms
+    tfidf_matrix = vectorizer.fit_transform([text])
+    feature_names = vectorizer.get_feature_names_out()
+    sorted_items = sorted(
+        zip(feature_names, tfidf_matrix.sum(axis=0).tolist()[0]),
+        key=lambda x: x[1],
+        reverse=True
+    )
+    
+    return [term for term, score in sorted_items[:n_themes]]
 @router.get("/visualize", response_class=HTMLResponse)
 async def visualize_themes(search: str = None, show_themes: bool = True, show_docs: bool = True):
-    # ... existing data loading code ...
+    """Endpoint to generate theme visualization"""
+    # 1. Extract themes from all documents
+    theme_docs = defaultdict(list)
+    documents = []
+    json_dir = Path("data/extracted_json")
     
+    for json_file in json_dir.glob("*.json"):
+        with open(json_file) as f:
+            data = json.load(f)
+            text = " ".join([p["text"] for p in data["pages"]])
+            doc_id = json_file.stem
+            themes = extract_key_themes(text)  # Using our new function
+            
+            documents.append({
+                "id": doc_id,
+                "title": doc_id.replace("_", " "),
+                "themes": themes
+            })
+            
+            for theme in themes:
+                theme_docs[theme].append(doc_id)
+    
+    # 2. Prepare visualization data
+    viz_themes = [
+        {
+            "id": f"theme_{i}",
+            "name": theme,
+            "count": len(docs),
+            "documents": docs
+        }
+        for i, (theme, docs) in enumerate(theme_docs.items())
+        if len(docs) >= 2  # Only show themes appearing in multiple docs
+    ]
+    
+    viz_documents = [
+        {
+            "id": doc["id"],
+            "title": doc["title"],
+            "themes": [t["id"] for t in viz_themes if t["name"] in doc["themes"]]
+        }
+        for doc in documents
+    ]
+    
+    # 3. Generate and return the visualization
     html = generate_d3_visualization(viz_themes, viz_documents)
     
     # Add URL parameter support
@@ -182,7 +242,7 @@ async def visualize_themes(search: str = None, show_themes: bool = True, show_do
         f'  showDocs: {"true" if show_docs else "false"}\n}};'
     )
     
-    return html
+    return HTMLResponse(content=html)
 def generate_filter_controls() -> str:
     """Generate HTML filter controls"""
     return """
