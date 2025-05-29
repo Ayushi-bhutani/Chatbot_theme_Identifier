@@ -33,7 +33,17 @@ nltk.download('punkt')  # This downloads the tokenizer models
 from nltk.tokenize import sent_tokenize
 from app.services.theme_analyzer import ThemeAnalyzer
 from app.static.theme_visualizer import router as viz_router
+from fastapi.responses import StreamingResponse
+from io import BytesIO
+from app.services.report_generator import ReportGenerator
+from app.services.theme_analyzer import ThemeAnalyzer
 
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 🔧 Replace all `print()` with:
+logger.info("message") or logger.error("message")
 
 # Load environment variables
 import os
@@ -187,37 +197,26 @@ async def upload_file(file: UploadFile = File(...)):
     """Handle PDF uploads with validation and processing"""
     file_content = await file.read(2048)
     await file.seek(0)
-    # Add to your upload endpoint
-    extracted_data = extract_text_from_pdf(pdf_path)
-    if extracted_data[0]['metadata']['is_scanned']:
-        extracted_data = apply_enhanced_ocr(pdf_path)  # Use OCR for scans
-    
-    # Store with paragraph-level metadata
-    json_path.write_text(json.dumps({
-        "pages": extracted_data,
-        "is_scanned": extracted_data[0]['metadata']['is_scanned']
-    }))
-    
+
     mime_type = magic.from_buffer(file_content, mime=True)
     if mime_type != 'application/pdf':
         raise HTTPException(400, "Only PDF files are accepted")
-    
+
     max_size = 50 * 1024 * 1024  # 50MB
     file.file.seek(0, 2)
     file_size = file.file.tell()
     await file.seek(0)
-    
+
     if file_size > max_size:
         raise HTTPException(400, "File too large. Max 50MB allowed")
-    
+
     pdf_path = PDF_DIR / file.filename
-    
     if pdf_path.exists():
         raise HTTPException(400, "File with this name already exists")
-    
+
     with open(pdf_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
-    
+
     try:
         with fitz.open(pdf_path) as doc:
             if not doc.is_pdf:
@@ -226,25 +225,30 @@ async def upload_file(file: UploadFile = File(...)):
     except:
         os.remove(pdf_path)
         raise HTTPException(400, "Invalid PDF file")
-    
+
     try:
         extracted_data = extract_text_from_pdf(pdf_path)
-        
+
+        # Fallback to OCR if document appears scanned
+        if extracted_data[0].get('metadata', {}).get('is_scanned'):
+            extracted_data = apply_enhanced_ocr(pdf_path)
+
         json_path = JSON_DIR / f"{file.filename}.json"
         with open(json_path, "w", encoding="utf-8") as jf:
             json.dump(extracted_data, jf, ensure_ascii=False, indent=2)
-        
+
         try:
             vector_db.index_document(file.filename, extracted_data)
         except Exception as vec_err:
-            print(f"Vector DB indexing error: {vec_err}")
-        
+            logger.error(f"Vector DB indexing error: {vec_err}")
+
         return {
             "filename": file.filename,
             "message": "Uploaded, text extracted, and indexed successfully.",
             "metadata": extracted_data[0].get("metadata", {}) if extracted_data else {},
             "vector_status": "indexed"
         }
+
     except Exception as e:
         if pdf_path.exists():
             os.remove(pdf_path)
@@ -252,6 +256,22 @@ async def upload_file(file: UploadFile = File(...)):
         if json_path.exists():
             os.remove(json_path)
         raise HTTPException(500, f"Failed to process PDF: {str(e)}")
+
+@app.get("/documents/")
+def list_documents():
+    documents = []
+    for json_file in JSON_DIR.glob("*.json"):
+        with open(json_file, encoding="utf-8") as f:
+            data = json.load(f)
+        metadata = data[0].get("metadata", {}) if data else {}
+        documents.append({
+            "filename": json_file.stem,
+            "page_count": metadata.get("page_count", len(data)),
+            "upload_date": metadata.get("upload_date", "N/A"),
+            "is_scanned": metadata.get("is_scanned", False),
+            "size_kb": os.path.getsize(PDF_DIR / f"{json_file.stem}.pdf") // 1024 if (PDF_DIR / f"{json_file.stem}.pdf").exists() else 0
+        })
+    return {"documents": documents}
 
 @app.post("/query/")
 async def query_documents(
@@ -348,7 +368,13 @@ async def summarize_theme(request: ThemeSummaryRequest):
         raise HTTPException(422, "Theme and snippets must be provided")
     
     summary = generate_theme_summary(request.theme, request.summary_snippets)
-    return ThemeResponse(theme=request.theme, gpt_summary=summary)
+    return {
+    "theme": request.theme,
+    "documents": request.documents,
+    "gpt_summary": summary
+}
+
+
 
 # --- Utility Functions ---
 def highlight_query(text: str, query: str, snippet_length: int = 300) -> str:
@@ -413,36 +439,37 @@ async def generate_report():
 from pdf2image import convert_from_path
 import pytesseract
 
-def apply_enhanced_ocr(pdf_path: Path) -> List[dict]:
-    """Process scanned PDFs with paragraph detection"""
+def apply_enhanced_ocr(pdf_path: Path) -> List[Dict]:
+    """Process scanned PDFs with OCR and return structured sentence data"""
     images = convert_from_path(pdf_path, dpi=300)
-    text_data = []
-    
+    structured_pages = []
+
     for i, image in enumerate(images):
-        # OCR with layout analysis
-        ocr_data = pytesseract.image_to_data(
-            image, 
-            output_type=pytesseract.Output.DICT,
-            config='--psm 6 -c preserve_interword_spaces=1'
-        )
-        
-        # Group by paragraphs
-        paragraph_id = 0
-        current_para = ""
-        
-        for j, word in enumerate(ocr_data['text']):
-            if ocr_data['block_num'][j] != paragraph_id:
-                if current_para.strip():
-                    text_data.append({
-                        "page": i+1,
-                        "paragraph": paragraph_id,
-                        "text": current_para.strip()
-                    })
-                current_para = ""
-                paragraph_id = ocr_data['block_num'][j]
-            current_para += word + " "
-    
-    return text_data
+        try:
+            # Enhance image and extract raw text
+            custom_config = r'--oem 3 --psm 6'
+            raw_text = pytesseract.image_to_string(image, config=custom_config)
+            sentences = sent_tokenize(raw_text)
+
+            structured_pages.append({
+                "page_number": i + 1,
+                "full_text": raw_text,
+                "sentences": [
+                    {"text": s.strip(), "sentence_id": idx}
+                    for idx, s in enumerate(sentences) if s.strip()
+                ]
+            })
+        except Exception as e:
+            print(f"OCR failed for page {i+1}: {e}")
+            structured_pages.append({
+                "page_number": i + 1,
+                "full_text": "",
+                "sentences": [],
+                "error": str(e)
+            })
+
+    return structured_pages
+
 from collections import defaultdict
 import networkx as nx
 import plotly.graph_objects as go
@@ -470,13 +497,17 @@ def generate_theme_network(min_docs: int = 3):
     # 1. Extract themes and document relationships
     theme_docs = defaultdict(list)
     for json_file in JSON_DIR.glob("*.json"):
-        with open(json_file) as f:
+        with open(json_file, encoding='utf-8') as f:
+            content = f.read()
+            print("File starts with:", content[:100])  # Preview
+            data = json.loads(content)
             text = " ".join([p["text"] for p in json.load(f)])
+
 
             themes = extract_key_themes(text)  # Reuse your theme extraction
             for theme in themes:
                 theme_docs[theme].append(json_file.stem)
-    
+ 
     # 2. Build network graph
     G = nx.Graph()
     for theme, docs in theme_docs.items():
@@ -516,3 +547,13 @@ def generate_theme_network(min_docs: int = 3):
         layout=go.Layout(showlegend=False, hovermode="closest")
     )
     return fig.to_json()
+@app.get("/api/report/pdf")
+async def generate_pdf_report():
+    analyzer = ThemeAnalyzer(JSON_DIR)
+    documents = analyzer.load_documents()
+    themes = analyzer.analyze_themes_tfidf()
+    reporter = ReportGenerator()
+    pdf = await reporter.generate_and_return_pdf(themes, documents)
+    return StreamingResponse(BytesIO(pdf), media_type="application/pdf", headers={
+        "Content-Disposition": "attachment; filename=theme_report.pdf"
+    })

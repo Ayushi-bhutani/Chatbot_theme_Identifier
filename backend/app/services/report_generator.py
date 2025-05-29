@@ -9,6 +9,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 import os
 from openai import AsyncOpenAI
 import asyncio
+from app.services.theme_analyzer import ThemeAnalyzer
 
 # Load environment variables
 load_dotenv()
@@ -117,3 +118,4 @@ class ReportGenerator:
         report = await self.generate_theme_report(themes, documents)
         pdf = await self.generate_pdf(report)
         return pdf
+    theme_analyzer = ThemeAnalyzer(json_dir="../data/extracted_json")
